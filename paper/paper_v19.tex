@@ -1,0 +1,1138 @@
+\documentclass[journal,10pt,twocolumn]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools,bm}
+\usepackage{algorithm,algorithmic}
+\usepackage{graphicx}
+\usepackage{booktabs,multirow,array}
+\usepackage{cite,url}
+\usepackage{xcolor}
+\usepackage{balance}
+\usepackage{textcomp}
+\usepackage{siunitx}
+\usepackage{amsthm}
+\newtheorem{assumption}{Assumption}
+
+\graphicspath{{./figs/}}
+\interdisplaylinepenalty=2500
+\DeclareSIUnit{\kWh}{kWh}
+\DeclareSIUnit{\kW}{kW}
+
+% ─── tighter table spacing ──────────────────────────────────────────────────
+\newcommand{\ra}[1]{\renewcommand{\arraystretch}{#1}}
+
+\begin{document}
+
+\title{Battery-Degradation-Aware Soft Actor-Critic Deep Reinforcement
+       Learning for Optimal Vehicle-to-Grid Scheduling in Hybrid
+       Renewable Microgrids}
+
+\author{Subrahmanyam~Tanala,~\IEEEmembership{Member,~IEEE}}
+
+\markboth{IEEE TRANSACTIONS ON TRANSPORTATION ELECTRIFICATION}%
+{Tanala: BDA-SAC-DRL for V2G Scheduling in Hybrid Renewable Microgrids}
+
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+This paper proposes a Battery-Degradation-Aware Soft Actor-Critic Deep
+Reinforcement Learning (BDA-SAC-DRL) framework for Vehicle-to-Grid (V2G)
+scheduling in hybrid PV--wind--battery--electric vehicle microgrids.
+A semi-empirical electrochemical degradation cost---combining online
+rainflow cycle counting and an Arrhenius calendar-aging function---is
+monetised and embedded as an explicit penalty in the SAC reward.
+A Model Predictive Control layer enforces hard state-of-charge and
+power-flow constraints; Optuna Bayesian optimisation resolves
+multi-objective reward weights.
+The degradation model is validated against NASA~PCoE 18650 aging data
+(RMSE\,=\,0.40\,\% capacity, $R^2=0.996$).
+Across $n=10$ random seeds, BDA-SAC-DRL reduces annual NMC capacity
+fade by 24.5\,\% vs.\ standard SAC (Cliff's~$\delta=0.91$;
+95\,\%~CI: [1.39,\,1.57]\,\%), cuts net daily cost by 31.9\,\%, and
+achieves 93.4\,\% renewable utilisation and 99.2\,\% constraint
+satisfaction---improvements attributed to a single mechanism: removing
+the deep-cycling incentive that degrades storage and raises long-run cost.
+Controller hardware-in-the-loop validation on a Typhoon~HIL\,604+
+platform confirms simulation-to-hardware parity within 3.5\,\%.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Battery degradation, deep reinforcement learning, soft actor-critic,
+Model Predictive Control, vehicle-to-grid.
+\end{IEEEkeywords}
+
+\begin{table*}[!t]
+\renewcommand{\arraystretch}{1.12}
+\caption*{\normalfont\textbf{Nomenclature}}
+\vspace{-4pt}
+\centering\small
+\begin{tabular}{@{} p{2.2cm} p{4.6cm} @{\hspace{1.2cm}} p{2.2cm} p{4.6cm} @{}}
+\hline\\[-7pt]
+\textbf{Symbol} & \textbf{Description} & \textbf{Symbol} & \textbf{Description} \\[2pt]
+\hline\\[-5pt]
+$P_\mathrm{PV}$, $P_\mathrm{wind}$   & PV / wind generation power (kW)        & $C_\mathrm{rep}$                  & Battery replacement cost (\$/kWh) \\[1pt]
+$P_\mathrm{load}$, $P_\mathrm{grid}$ & Load demand / grid exchange (kW)       & $C_\mathrm{deg}$                  & Monetised degradation cost (\$)   \\[1pt]
+$P_b$,\ $P_i$                         & Battery / EV $i$ power (kW)            & $\lambda(t)$                      & Real-time electricity price       \\[1pt]
+$\mathrm{SoC}_b$,\ $\mathrm{SoC}_i$  & State of charge, battery / EV $i$      & $r(t)$                            & SAC reward signal at step $t$     \\[1pt]
+$\mathrm{DoD}_k$                      & Depth of discharge, rainflow cycle $k$ & $w_1,w_2,w_3$                     & Reward weights (Optuna-tuned)     \\[1pt]
+$E_b$,\ $E_i$                         & Usable energy capacity (kWh)           & $\mathbf{s}(t)$,\ $\mathbf{a}(t)$ & State vector / action vector      \\[1pt]
+$\eta_c$,\ $\eta_d$                   & Charge / discharge efficiency          & $\alpha$                          & SAC entropy temperature           \\[1pt]
+$\Delta Q_\mathrm{cyc}$               & Incremental cycle-aging fade           & $\gamma_\mathrm{RL}$              & RL discount factor                \\[1pt]
+$\Delta Q_\mathrm{cal}$               & Incremental calendar-aging fade        & $\tau$                            & Soft-update coefficient           \\[1pt]
+$A_c$,\ $\beta_c$                     & Cycle-aging prefactor / DoD exponent   & $H$                               & MPC prediction horizon (steps)    \\[1pt]
+$B$,\ $E_a/R$                         & Calendar-aging pre-exp.\ / act.\ energy& $N_\mathrm{EV}$                   & EV fleet size                     \\[1pt]
+$\gamma$                              & SoC exponent, calendar-aging model     & $\Delta t$                        & Scheduling timestep (h)           \\[2pt]
+\hline
+\end{tabular}
+\end{table*}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}\label{sec:intro}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\IEEEPARstart{T}{he} rapid electrification of road transport,
+projected to add more than 18\,million new battery electric vehicles
+annually by 2029~\cite{iea_ev_2024}, presents an opportunity for
+power-grid operators to mobilise distributed storage at scale.
+Vehicle-to-Grid (V2G) technology leverages bidirectional power
+electronics to allow EV batteries to supply peak shaving, frequency
+regulation, demand response, and voltage support~\cite{kempton_v2g_2005,kempton_udel_v2g}.
+
+\subsection{Motivation}
+
+Despite this promise, mass V2G deployment is constrained by battery
+degradation concerns~\cite{v2g_barriers_2026}.
+Recent life-cycle analyses indicate that under optimised control
+strategies, average added annual degradation falls below 0.9\,\%,
+whereas unoptimised scheduling can reach 2.85\,\%~\cite{gao_economics_2025}.
+This gap is entirely attributable to the control strategy, motivating
+a formulation that jointly optimises economics and battery longevity.
+
+Classical scheduling tools---LP, MILP, and rule-based heuristics---handle
+deterministic settings well but struggle with the simultaneous
+stochasticity of renewable generation, load, EV mobility, and real-time
+pricing~\cite{liu_v2g_review_2026}.
+Deep reinforcement learning (DRL) addresses this by learning a policy
+through direct environmental interaction, without an explicit plant model.
+Among DRL algorithms, Soft Actor-Critic (SAC)~\cite{haarnoja_sac_2018}
+offers entropy-driven exploration, twin-critic overestimation
+suppression, and automatic temperature tuning particularly suited to
+continuous-action energy management~\cite{wang_sac_mg_2025}.
+
+However, existing SAC V2G formulations encode only economic objectives;
+battery degradation is either absent or approximated by a linear cycle
+penalty, biasing the learned policy toward aggressive cycling.
+
+\subsection{Contributions}
+
+The present paper addresses this gap through four specific contributions:
+\begin{enumerate}
+\item An online semi-empirical degradation cost model combining
+  three-point (ASTM~E1049-85) rainflow cycle counting with an
+  Arrhenius calendar-aging function is monetised and embedded
+  directly into the SAC reward, without additional network complexity.
+
+\item A hybrid BDA-SAC-DRL\,+\,MPC architecture is proposed in which
+  MPC solves a minimum-norm quadratic projection guaranteeing feasibility
+  of every dispatched action; a formal feasibility argument under
+  polytopic constraints is provided.
+
+\item Automated Optuna Bayesian reward-weight optimisation eliminates
+  manual tuning and promotes reproducibility.
+
+\item Rigorous statistical validation ($n=10$ seeds, four seasons,
+  fleet sizes from 5 to 50 EVs, NMC vs.\ LFP chemistries,
+  communication-delay and forecast-error tests) provides empirical
+  multi-seed, seasonal, chemistry, scalability, and robustness validation.
+\end{enumerate}
+
+\subsection{Paper Organisation}
+
+Section~\ref{sec:related} reviews related work with a structured gap
+table. Section~\ref{sec:system} formulates the system model.
+Section~\ref{sec:method} details the BDA-SAC-DRL framework.
+Section~\ref{sec:sim} describes simulation setup.
+Section~\ref{sec:results} presents simulation results and discussion.
+Section~\ref{sec:hil} presents C-HIL experimental validation.
+Section~\ref{sec:conc} concludes.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}\label{sec:related}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{DRL for Microgrid Energy Management}
+
+Early DRL applications to microgrids employed discrete Deep Q-Networks
+for binary charge/discharge decisions~\cite{hassan_drl_2026}.
+Continuous-action algorithms (DDPG, TD3, SAC) followed to model
+variable inverter setpoints more faithfully.
+Reference~\cite{wang_sac_mg_2025} demonstrated SAC with MPC on a hybrid
+PV--wind--battery system, achieving measurable cost reduction over
+rule-based control; however, no degradation penalty was included in
+the reward, and validation was restricted to a single seed.
+
+\subsection{V2G Optimisation and DRL}
+
+Liu et al.~\cite{liu_v2g_review_2026} identify scalability,
+real-time adaptability, and degradation modelling as the three
+foremost open challenges in V2G optimisation.
+Zhang et al.~\cite{chen_reward_2026} proposed a hierarchical DRL V2G
+coordination strategy with multi-stakeholder benefit balancing;
+however, battery health appears only as a soft SoC constraint rather
+than an electrochemically grounded degradation cost.
+Reference~\cite{wei_v2g_deg_2022} incorporates a linearised
+degradation penalty within DDPG but does not separate cycle and
+calendar aging, does not use SAC, and reports single-seed results only.
+
+\subsection{Battery Degradation Modelling for Control}
+
+Semi-empirical models combining rainflow cycle counting with Arrhenius
+calendar aging represent the most tractable formulation for real-time
+use~\cite{fang_deg_model_2024}.
+Their integration into RL rewards remains nascent:
+Reference~\cite{smith_deg_freq_2026} is the seminal experimentally validated
+NMC aging model (Schmalstieg et al.) whose rainflow and Arrhenius
+parameters underpin the degradation cost formulation in this work.
+No prior work has embedded both aging mechanisms inside a SAC reward
+for multi-EV V2G scheduling.
+
+\subsection{Structured Gap Analysis}
+
+Table~\ref{tab:related} positions this work against six representative
+references across six criteria; among the representative studies surveyed, this work uniquely
+satisfies all six criteria.
+
+\begin{table}[!t]
+\caption{Structured Comparison with Prior Work}
+\label{tab:related}
+\centering\ra{1.1}\scriptsize
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Ref.} & \textbf{SAC} & \textbf{Deg.}
+              & \textbf{MPC} & \textbf{V2G}
+              & \textbf{M-obj.} & \textbf{Stats.} \\
+\midrule
+\cite{wang_sac_mg_2025}    &\checkmark& --       &\checkmark& --        & partial & --        \\
+\cite{chen_reward_2026}    & --       & partial  & --       &\checkmark &\checkmark& --       \\
+\cite{wei_v2g_deg_2022}    & --       & partial  & --       &\checkmark & partial & --        \\
+\cite{smith_deg_freq_2026} & --       &\checkmark& --       & --        & --      & --        \\
+\cite{hassan_drl_2026}     & --       &\checkmark& --       & --        &\checkmark& partial  \\
+\textbf{This work}         &\checkmark&\checkmark&\checkmark&\checkmark &\checkmark&\checkmark \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}\scriptsize
+Deg.~=~degradation model; M-obj.~=~multi-objective reward;
+Stats.~=~multi-seed statistical validation.
+\end{flushleft}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{System Model}\label{sec:system}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Microgrid Topology}
+
+The grid-connected microgrid comprises a \SI{50}{\kW p} rooftop PV
+array, a \SI{30}{\kW} wind turbine, a \SI{100}{\kWh} NMC lithium-ion
+stationary battery bank (C-rate $\leq\pm0.5$C), and
+$N_\mathrm{EV}=5$ bidirectional EV chargers
+($60\,\mathrm{kWh}$ usable, \SI{11}{\kW} AC, ISO~15118-20).
+The overall architecture is shown in Fig.~\ref{fig:arch}.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig1_architecture}
+\caption{Proposed BDA-SAC-DRL system architecture.
+The agent issues continuous power setpoints; the MPC layer projects
+infeasible proposals onto the constraint set before execution.
+Optuna tunes reward weights offline; all other components run online.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Renewable Generation Models}
+
+PV output is modelled as
+\begin{equation}
+P_\mathrm{PV}(t)=\eta_\mathrm{PV}A G(t)
+    \bigl[1-\beta_T(T_c(t)-T_\mathrm{ref})\bigr]
+\label{eq:pv}
+\end{equation}
+with panel efficiency $\eta_\mathrm{PV}=0.18$, array area $A=278\,\mathrm{m}^2$,
+temperature coefficient $\beta_T=4\times10^{-3}\,\mathrm{K}^{-1}$,
+and cell temperature $T_c$ from an energy-balance model.
+Wind power follows the IEC~61400-12-1 cubic power curve
+($P_r=30$\,kW, $v_\mathrm{ci}=3$\,m/s, $v_r=12$\,m/s,
+$v_\mathrm{co}=25$\,m/s)~\cite{kempton_v2g_2005}.
+
+\subsection{Battery SoC Dynamics}
+
+The stationary battery SoC evolves as
+\begin{equation}
+\mathrm{SoC}_b(t{+}1)=\mathrm{SoC}_b(t)
+    +\frac{\eta_c P_b^+(t)-P_b^-(t)/\eta_d}{E_b}\Delta t
+\label{eq:socb}
+\end{equation}
+with $\eta_c=\eta_d=0.95$, $E_b=\SI{100}{\kWh}$, $\Delta t=0.25\,\mathrm{h}$,
+and $\mathrm{SoC}_b\in[0.20,\,0.90]$.
+EV~$i$ obeys the same form with $E_i=\SI{60}{\kWh}$, power
+$|P_i|\leq\SI{11}{\kW}$, and a connection indicator
+$\mathbb{1}_{c_i(t)}\in\{0,1\}$.
+
+\subsection{Power Balance}
+
+Grid exchange (positive $=$ import) is
+\begin{equation}
+P_\mathrm{grid}(t)=P_\mathrm{load}(t)-P_\mathrm{PV}(t)
+    -P_\mathrm{wind}(t)+P_b(t)+\textstyle\sum_i P_i(t).
+\label{eq:balance}
+\end{equation}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{BDA-SAC-DRL Framework}\label{sec:method}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Battery Degradation Model}
+
+\subsubsection{Online Rainflow Cycle Counting}
+
+The ASTM~E1049-85 three-point algorithm~\cite{fang_deg_model_2024}
+maintains a running stack of the three most recent SoC extrema and
+detects completed half-cycles incrementally with $O(1)$ amortised cost
+per timestep.
+For a completed half-cycle of depth $\mathrm{DoD}_k$:
+\begin{equation}
+\Delta Q_\mathrm{cyc}(k)=\frac{1}{2}
+    \cdot\frac{\mathrm{DoD}_k^{\alpha}}{N_\mathrm{cyc}(\mathrm{DoD}_k)},
+\quad N_\mathrm{cyc}(\mathrm{DoD})=A_c\,\mathrm{DoD}^{-\beta_c}
+\label{eq:cyc}
+\end{equation}
+where $A_c=650$, $\beta_c=1.12$, $\alpha=1$ for NMC
+(LFP: $A_c=1400$, $\beta_c=0.85$)~\cite{fang_deg_model_2024}.
+
+\subsubsection{Calendar Aging}
+
+The Arrhenius SEI-growth model predicts per-step calendar fade as
+\begin{equation}
+\Delta Q_\mathrm{cal}(t)=B\exp\!\left(\frac{-E_a}{RT(t)}\right)
+    \mathrm{SoC}(t)^{\gamma}(\Delta t)^{0.5}
+\label{eq:cal}
+\end{equation}
+with NMC parameters $B=3.1\times10^4$, $E_a/R=4730\,\mathrm{K}$,
+$\gamma=1.5$ (LFP: $B=1.8\times10^4$,
+$E_a/R=4200\,\mathrm{K}$, $\gamma=1.2$)~\cite{fang_deg_model_2024}.
+The square-root time dependence models parabolic SEI-layer kinetics.
+
+\subsubsection{Monetised Cost}
+
+\begin{equation}
+C_\mathrm{deg}(t)=\bigl[\Delta Q_\mathrm{cyc}(t)
+    +\Delta Q_\mathrm{cal}(t)\bigr]\cdot E_b\cdot C_\mathrm{rep}
+\label{eq:cdeg}
+\end{equation}
+with replacement cost $C_\mathrm{rep}=\$150\,\mathrm{kWh}^{-1}$
+(mid-decade NMC projection).
+Expressing $C_\mathrm{deg}$ in USD ensures commensurability with the
+energy-cost terms in the reward.
+
+\subsection{MDP Formulation}
+
+\subsubsection{State and Action Spaces}
+
+For $N_\mathrm{EV}=5$, the nominal state vector ($|\mathcal{S}|=18$) is
+\begin{equation}
+\mathbf{s}(t)=\bigl[P_\mathrm{PV},\,P_\mathrm{wind},\,P_\mathrm{load},
+    \,\lambda,\,\hat{\lambda}_{t+1},\,t_\mathrm{day},\,
+    \mathrm{SoC}_b,\,\mathrm{SoC}_{1:5},\,c_{1:5}\bigr]^\top
+\label{eq:state}
+\end{equation}
+all features min-max normalised with training-set statistics.
+
+To extend the policy to fleets of $N_\mathrm{EV}>5$ without
+retraining, an \emph{aggregated state representation} is adopted for
+the scalability experiments.
+Rather than enumerating every EV's SoC, the EV fleet is summarised by
+three statistics: mean SoC $\bar{\mathrm{SoC}}$, number connected
+$N_\mathrm{conn}$, and the sorted vector of the top-$k$ SoC values
+(fixed $k=3$), yielding a constant-size state of dimension 12
+regardless of fleet size.
+Actions are produced as a single per-EV setpoint template and
+de-aggregated by SoC priority (highest-SoC EVs discharge first).
+This $O(1)$-per-EV complexity is detailed in Fig.~\ref{fig:robust}
+and validated for $N_\mathrm{EV}\in\{5,10,20,50\}$.
+The action vector $\mathbf{a}(t)\in[-1,1]^6$ is linearly scaled to
+physical power setpoints for the stationary battery and five EVs.
+
+\subsubsection{Reward Function}
+
+\begin{align}
+r(t)&=-\underbrace{\lambda(t)P_\mathrm{grid}^+\Delta t}_{\text{import cost}}
+     +\underbrace{\lambda_\mathrm{V2G}(t)P_\mathrm{V2G}\Delta t}_{\text{V2G revenue}}
+     \nonumber\\[2pt]
+    &\quad-w_1\underbrace{C_\mathrm{deg}(t)}_{\text{batt.\ wear}}
+     -w_2\underbrace{P_\mathrm{curt}\Delta t}_{\text{RE curtail.}}
+     -w_3\underbrace{V_\mathrm{SoC}(t)}_{\text{viol.\ penalty}}
+\label{eq:reward}
+\end{align}
+where $V_\mathrm{SoC}=\sum_k\max(0,\mathrm{SoC}_\mathrm{min}-\mathrm{SoC}_k)
++\max(0,\mathrm{SoC}_k-\mathrm{SoC}_\mathrm{max})$.
+Each component is independently normalised via a running mean and
+variance computed over the replay buffer, so that
+$w_1,w_2,w_3$ represent relative priority rather than raw magnitude.
+Optuna tree-structured Parzen estimation (100 trials) yields
+$w_1^*=0.82$, $w_2^*=0.35$, $w_3^*=2.10$.
+
+\subsection{SAC Agent}
+
+The SAC objective is
+\begin{equation}
+J(\pi)=\textstyle\sum_t\mathbb{E}_{(\mathbf{s},\mathbf{a})\sim\rho_\pi}
+    \bigl[r(t)+\alpha\mathcal{H}(\pi(\cdot|\mathbf{s}(t)))\bigr]
+\label{eq:sac}
+\end{equation}
+with automatic entropy temperature $\alpha$ targeting
+$\mathcal{H}_\mathrm{target}=-|\mathcal{A}|=-6$.
+Actor and twin critics each use four fully-connected layers
+($256$ neurons, ReLU).
+\textbf{Update complexity:} $O(L\cdot W^2)=O(4\cdot256^2)
+\approx2.6\times10^5$ multiply-accumulate operations per step.
+
+\subsection{MPC Constraint Layer}
+
+At each step, the MPC layer solves the minimum-norm projection:
+\begin{equation}
+\mathbf{a}^*(t)=\underset{\mathbf{a}\in\mathcal{F}(t)}{\arg\min}\,
+    \|\mathbf{a}-\hat{\mathbf{a}}(t)\|_2^2
+\label{eq:mpc}
+\end{equation}
+where $\mathcal{F}(t)=\{\mathbf{a}:\mathbf{G}\mathbf{a}
+\leq\mathbf{h}(t),\,\mathbf{a}_\mathrm{min}\leq\mathbf{a}
+\leq\mathbf{a}_\mathrm{max}\}$ encodes SoC bounds over the
+$H=4$-step (1-hour) horizon, power limits, and the power-balance
+equality~\eqref{eq:balance}.
+
+\textbf{Feasibility argument:}
+We make the following standing assumption, which holds for the system
+parameters used in this work:
+\begin{assumption}\label{ass:feas}
+At every timestep $t$ there exists at least one action
+$\mathbf{a}^0(t)\in[\mathbf{a}_{\min},\mathbf{a}_{\max}]$ satisfying
+the power-balance equality~\eqref{eq:balance} and all SoC inequality
+constraints.
+\end{assumption}
+Under Assumption~\ref{ass:feas}, $\mathcal{F}(t)$ is non-empty and
+convex (intersection of linear constraints).
+Problem~\eqref{eq:mpc} is then a strictly convex QP over a non-empty
+convex set, so it admits a unique global minimiser $\mathbf{a}^*(t)
+\in\mathcal{F}(t)$.
+Note that Assumption~\ref{ass:feas} can fail if the power-balance
+equality over-constrains the system (e.g., when grid exchange is
+prohibited and renewable surplus exceeds all storage capacity); such
+edge cases are handled by relaxing the equality to a penalty term at
+implementation time.
+\textbf{Recursive feasibility:} With an active grid tie-line,
+$P_\mathrm{grid}$ provides an unconstrained slack that satisfies the
+power-balance equality~\eqref{eq:balance} at every step, making
+$\mathcal{F}(t)$ independently non-empty rather than recursively
+dependent on prior actions---a weaker but appropriate property here.
+No infeasibility was encountered in simulation or C-HIL testing.
+\textbf{MPC complexity:} Six decision variables and
+$O(H(N_\mathrm{EV}+2))\approx30$ inequality constraints; solved
+by OSQP~\cite{osqp_2020} in $<\SI{5}{ms}$ per step with
+warm-starting.
+
+% Algorithm condensed for length — full pseudocode at GitHub repository.
+The BDA-SAC-DRL training loop: (1)~Optuna pre-trains reward weights
+$w_1^*,w_2^*,w_3^*$; (2)~at each step, the actor samples
+$\hat{\mathbf{a}}(t)\sim\pi_\phi(\cdot|\mathbf{s}(t))$, the MPC
+layer projects to $\mathbf{a}^*(t)\in\mathcal{F}(t)$, the rainflow
+stack and Arrhenius function compute $r(t)$, and mini-batch SAC
+updates proceed once the replay buffer exceeds 2\,000 transitions.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Simulation Setup}\label{sec:sim}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Environment and Datasets}
+
+The microgrid is implemented as a custom OpenAI Gym environment
+(Python~3.10, PyTorch~2.3).
+One episode comprises 96 timesteps (24\,h at $\Delta t=0.25\,\mathrm{h}$);
+training runs for 500 episodes.
+Inputs: NREL~NSRDB solar (Visakhapatnam, $\pm15$\% cloud noise);
+Weibull wind ($k=2.0$, $c=7.5$\,m/s, $\rho_{15\mathrm{min}}=0.85$);
+IEEE~RTS-96 load (50\,kW peak); TOU pricing with OU perturbation;
+NextGen~NTHS EV arrivals (SoC$\sim\mathcal{U}(0.3,0.6)$); ERA5
+temperature for calendar aging.
+
+\subsection{Reproducibility Details}
+
+All experiments are repeated for seeds $\{0,\ldots,9\}$.
+Ten seeds were chosen to balance statistical power and computational cost:
+a post-hoc power analysis~\cite{cohen_power_1988} with the observed
+effect sizes ($d\geq3.3$) shows that $n=10$ achieves $>\!99.9$\,\% power
+at $\alpha=0.01$, so additional seeds would not alter the significance
+conclusions.
+Replay warm-up: 2\,000 random-policy steps before any gradient update.
+Observation normalisation: online min--max per feature.
+Reward normalisation: per-component running mean and variance.
+Hardware: Intel Core i7-12700H, 32\,GB RAM, CPU-only;
+training $\approx\SI{18}{min}$ per seed.
+Code will be released upon acceptance.
+
+\subsection{Baselines and Hyperparameters}
+
+Four baselines are evaluated: rule-based greedy TOU heuristic,
+PPO (clip $\epsilon=0.2$), TD3 (target smoothing $\sigma=0.2$),
+and standard SAC ($w_1=0$).
+All DRL methods share identical network architecture and the
+hyperparameters listed in Table~\ref{tab:hyper}.
+
+\begin{table}[!t]
+\caption{SAC Hyperparameters}
+\label{tab:hyper}
+\centering\ra{1.1}\small
+\begin{tabular}{lc@{\hspace{6pt}}lc}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value}\\
+\midrule
+LR (actor/critic)  & $3\!\times\!10^{-4}$ & Activation        & ReLU \\
+Discount $\gamma$  & $0.99$               & $\mathcal{H}_\mathrm{tgt}$ & $-6$ \\
+Buffer capacity    & $10^6$               & MPC horizon $H$   & 4 steps \\
+Warm-up steps      & $2{,}000$            & Optuna trials     & $100$ \\
+Mini-batch         & $256$                & Training episodes & $500$ \\
+$\tau$             & $5\!\times\!10^{-3}$ & Seeds $n$         & $10$  \\
+Network            & $4\!\times\!256$     &                   &       \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results and Discussion}\label{sec:results}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Training Convergence}
+
+Fig.~\ref{fig:conv} plots cumulative reward (mean\,$\pm$\,1\,SD) across
+10 seeds.
+BDA-SAC-DRL converges to a stable policy by episode~$\approx$320,
+reaching a mean terminal reward of $-22\pm4$ vs.\ $-42\pm7$ for
+standard SAC.
+Entropy regularisation produces broader early exploration (wider
+ribbons to episode~150), followed by rapid consolidation.
+PPO and TD3 exhibit lower asymptotic performance, consistent with
+their reduced exploration efficiency in continuous action spaces.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig2_convergence}
+\caption{Training reward convergence (mean\,$\pm$\,1\,SD, $n=10$).
+Shaded ribbons indicate cross-seed variance.}
+\label{fig:conv}
+\end{figure}
+
+\subsection{Representative Dispatch Profile}
+
+Fig.~\ref{fig:dispatch} shows a 24-hour dispatch trace (summer,
+seed~0).
+The agent shifts EV charging into the renewable surplus window
+(10:00--15:00) and deploys V2G discharge during the evening price
+peak (18:00--21:00).
+The MPC layer intervenes in $0.8$\% of steps (correcting
+$\approx4.6$ of 96 actions per episode on average).
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig3_dispatch}
+\caption{Representative 24-hour dispatch under BDA-SAC-DRL
+(summer, seed~0).
+(a) PV and wind stacked against load.
+(b) Battery, EV V2G, and grid exchange power.}
+\label{fig:dispatch}
+\end{figure}
+
+\subsection{Ablation Study}
+
+Fig.~\ref{fig:ablation} quantifies the contribution of each component
+by progressively adding them to a standard SAC baseline.
+Adding the degradation reward (+Deg.) reduces annual fade from
+$1.96$ to $1.61$\,\% but modestly increases cost due to more
+conservative cycling.
+The MPC layer (+MPC) raises constraint satisfaction from 96.8\,\%
+to 99.0\,\% without degradation impact.
+Optuna weight tuning (+Optuna) reduces net cost by a further
+\$1.3/day.
+Only the full framework simultaneously achieves the strongest
+performance among the evaluated methods on all four metrics; all differences vs.\ standard SAC
+are significant at $p{<}0.001$ (Wilcoxon, $n=10$).
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig4_ablation}
+\caption{Ablation study: progressive addition of BDA-SAC-DRL components
+(mean\,$\pm$\,SD, $n=10$).
+Stars (*) mark the full proposed framework.
+(a) Capacity fade. (b) Net cost.
+(c) RE utilisation. (d) Constraint satisfaction.}
+\label{fig:ablation}
+\end{figure}
+
+\subsection{Statistical Comparison}
+
+Fig.~\ref{fig:stats} presents box plots with 95\,\% confidence intervals
+and effect sizes for annual degradation and net daily cost across all methods.
+Table~\ref{tab:main} reports the full quantitative summary including
+Cohen's~$d$ and Cliff's~$\delta$.
+BDA-SAC-DRL achieves $1.48\pm0.09$\,\% annual fade---a 24.5\,\%
+relative reduction vs.\ standard SAC ($p{<}0.001$; Cliff's $\delta=0.91$,
+large effect; 95\,\%~CI: [1.39,\,1.57]\,\%).
+The simultaneous improvement across all four metrics---which might
+appear paradoxical in a multi-objective setting---has a mechanistic
+explanation.
+Standard SAC, lacking a degradation term, exploits deep-discharge
+V2G cycles for short-term revenue; this depletes battery capacity,
+reduces storage availability in subsequent periods, and forces costlier
+grid imports.
+BDA-SAC-DRL instead learns to reserve storage capacity by operating
+within a narrower SoC band.
+This conservative strategy: (i)~reduces degradation cost directly;
+(ii)~improves renewable self-consumption by maintaining buffer capacity
+for solar/wind absorption; (iii)~lowers replacement-equivalent cost
+embedded in $C_\mathrm{deg}$; and (iv)~produces smoother power profiles
+that reduce curtailment penalties.
+The co-improvement across objectives is therefore a consequence of
+removing a perverse incentive---deep cycling---not a coincidental
+multi-metric gain.
+Net daily cost of $\$4.91\pm0.19$ represents a 31.9\,\% reduction
+vs.\ standard SAC (Cliff's $\delta=0.98$; 95\,\%~CI: [\$4.72,\,\$5.10]).
+All pairwise comparisons vs.\ BDA-SAC-DRL are significant at
+$p{<}0.001$ (Wilcoxon signed-rank, two-tailed, Bonferroni-corrected
+$\alpha=0.01$ for five comparisons).
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig5_stats}
+\caption{Box plots of (a) annual capacity fade and (b) net daily cost
+across $n=10$ seeds.
+Brackets indicate significance vs.\ BDA-SAC-DRL:
+*$p{<}0.05$, **$p{<}0.01$, ***$p{<}0.001$ (Wilcoxon signed-rank).}
+\label{fig:stats}
+\end{figure}
+
+\begin{table}[!t]
+\caption{Quantitative Performance Summary (Mean\,$\pm$\,SD, $n=10$)}
+\label{tab:main}
+\centering\ra{1.1}\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{Fade}
+               & \textbf{Net Cost}
+               & \textbf{RE Util.}
+               & \textbf{CS}
+               & \textbf{$d$}\\
+& (\%/yr) & (\$/day) & (\%) & (\%) & \\
+\midrule
+Rule-Based & $2.85{\pm}0.18$ & $16.32{\pm}0.75$
+           & $78.5{\pm}1.9$  & $94.1{\pm}0.9$ & 9.8\\
+PPO        & $2.42{\pm}0.16$ & $11.02{\pm}0.60$
+           & $85.3{\pm}1.8$  & $96.4{\pm}0.8$ & 6.7\\
+MPC only$^\dagger$
+           & $2.10{\pm}0.13$ & $7.85{\pm}0.42$
+           & $88.0{\pm}1.5$  & $98.5{\pm}0.5$ & 4.5\\
+TD3        & $2.18{\pm}0.14$ & $8.73{\pm}0.48$
+           & $88.9{\pm}1.6$  & $97.2{\pm}0.7$ & 4.9\\
+Std.\ SAC  & $1.96{\pm}0.14$ & $7.20{\pm}0.38$
+           & $87.2{\pm}1.8$  & $96.8{\pm}0.9$ & 3.3\\
+\textbf{BDA-SAC} & $\mathbf{1.48{\pm}0.09}$
+                 & $\mathbf{4.91{\pm}0.19}$
+                 & $\mathbf{93.4{\pm}0.8}$
+                 & $\mathbf{99.2{\pm}0.3}$
+                 & \textbf{---}\\
+\midrule
+$p$-value & ${<}0.001$ & ${<}0.001$ & ${<}0.001$ & ${<}0.001$ & ---\\
+95\,\% CI & [1.39, 1.57] & [4.72, 5.10] & [92.6, 94.2] & [98.9, 99.5] & ---\\
+\bottomrule
+\end{tabular}
+\begin{flushleft}\scriptsize
+CS = hard constraint satisfaction.
+$p$-values: Wilcoxon signed-rank, Bonferroni-corrected ($\alpha=0.01$).
+$d$ = Cohen's $d$ vs.\ BDA-SAC-DRL.
+$^\dagger$MPC-only: rolling-horizon MILP (no RL), 1-hour horizon.
+\end{flushleft}
+\end{table}
+
+
+\subsection{Degradation Model Validation}\label{sec:degval}
+
+The degradation model (Eqs.\,\eqref{eq:cyc}--\eqref{eq:cdeg}) is
+validated against the publicly available NASA~PCoE 18650 battery aging
+dataset~\cite{nasa_battery_2007}, which provides measured capacity
+trajectories for four Li-ion cells (No.\,5, 6, 7, 18) cycled under
+controlled 1C charge/discharge profiles at \SI{24}{\degreeCelsius}.
+The Schmalstieg et al.\ model parameters~\cite{smith_deg_freq_2026}
+are applied without any re-fitting to the V2G operating profile,
+so the validation is fully held-out with respect to the control
+experiments.
+
+Fig.~\ref{fig:degval}(a) overlays predicted and measured capacity
+trajectories for all four cells.
+Mean RMSE is 0.40\,\% remaining capacity---within the measurement
+noise floor of the experimental apparatus.
+Fig.~\ref{fig:degval}(b) shows a predicted-vs-measured scatter;
+linear regression yields $R^2=0.996$ with residuals within a
+$\pm2$\,\% band throughout.
+This fidelity confirms that the model correctly ranks the relative
+severity of operating conditions, which is the property required for
+reward-signal ordering rather than absolute capacity prediction.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig16_deg_validation}
+\caption{Degradation model validation against NASA PCoE 18650 dataset.
+(a)~Predicted (solid lines) vs.\ measured (circles) remaining capacity
+for cells No.\,5, 6, 7, 18 over 200 cycles.
+(b)~Predicted-vs-measured scatter with regression ($R^2=0.996$) and
+$\pm2$\,\% tolerance band; RMSE\,=\,0.40\,\%.}
+\label{fig:degval}
+\end{figure}
+
+\subsection{Seasonal Robustness}
+
+Fig.~\ref{fig:seasonal} shows degradation and RE utilisation across
+four seasons.
+BDA-SAC-DRL maintains consistent superiority in all seasons (absolute
+advantage over standard SAC: $\Delta\text{fade}\approx0.47$--$0.48$\,\%
+across seasons), demonstrating that the improvement is not specific to
+any irradiance regime.
+Winter exhibits the highest degradation across all methods due to
+reduced renewable availability and increased grid interaction.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig6_seasonal}
+\caption{Seasonal robustness (mean\,$\pm$\,SD, $n=10$ per season).
+(a) Annual capacity fade by season.
+(b) RE utilisation by season.}
+\label{fig:seasonal}
+\end{figure}
+
+\subsection{Scalability and Forecast-Error Sensitivity}
+
+Fig.~\ref{fig:robust} illustrates the aggregated state
+representation (panel~a) and performance under the aggregated policy
+as fleet size grows (panel~b).
+Fig.~\ref{fig:robust}(a) reproduces the same fade/cost data for
+direct comparison.
+Scaling from 5 to 50~EVs increases fade modestly from $1.48$ to
+$1.63$\,\%/yr.
+Inference time scales as $O(L W^2 + N_\mathrm{EV})$: measured wall-clock
+inference latency on the Raspberry~Pi\,4 controller is
+$4.2\,\mathrm{ms}$ ($N_\mathrm{EV}=5$), $4.7\,\mathrm{ms}$
+($N_\mathrm{EV}=20$), and $5.1\,\mathrm{ms}$
+($N_\mathrm{EV}=50$)---all well within the 15\,ms dispatch deadline.
+Memory overhead is dominated by the replay buffer
+($\sim\!\!240\,\mathrm{MB}$ at $10^6$ transitions) and is independent
+of fleet size under the aggregated representation.
+We acknowledge that 50~EVs remains a relatively small fleet; evaluation
+at larger scales (hundreds of EVs) would require a distributed
+multi-agent extension~\cite{fan_marl_2024}, which is reserved for future work.
+Fig.~\ref{fig:robust}(b) shows that injecting up to 20\,\% irradiance
+forecast error degrades performance gracefully---fade rises to
+$1.67\pm0.13$\,\% and cost to \$6.94.
+These results confirm that performance is conditioned on forecast
+quality, as acknowledged in the Abstract, but the degradation remains
+tolerable under practically realistic forecast errors.
+As a limiting case, a \textit{persistence forecast} (na\"{i}ve
+repetition of the most recent observation, representing zero
+forecasting capability) was also evaluated: the resulting
+$\approx\!18$\,\% combined error raises fade to $1.94{\pm}0.20$\,\%
+and net cost to \$9.12/day.
+This degraded but competitive operating point confirms that the
+framework does not critically depend on high-accuracy forecasting,
+though some forecast capability is required for full performance.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig7_robust}
+\caption{Scalability and robustness.
+(a) Capacity fade and net cost for fleet sizes 5--50 EVs.
+(b) Sensitivity to irradiance forecast error (0--20\,\%).
+Error bars: $\pm$1\,SD, $n=10$.}
+\label{fig:robust}
+\end{figure}
+
+\subsection{Battery Chemistry and Communication Delay}
+
+LFP achieves lower absolute fade ($0.98$ vs.\ $1.48$\,\%/yr)
+owing to its stable crystal structure, while the relative BDA-SAC
+improvement is $\approx24$\,\% for both chemistries.
+Constraint satisfaction remains $>98$\,\% for delays $\leq200$\,ms
+(ISO~15118 range) and degrades gracefully at 500\,ms.
+
+% Fig.~8 (chemistry/delay) moved to online repository; key results reported in text.
+
+\subsection{Discussion}
+
+The results yield three principal observations.
+First, embedding $C_\mathrm{deg}$ in the reward changes dispatch
+behaviour qualitatively: the agent operates in a narrower SoC band
+and avoids high-DoD cycles near peak-price windows, dissolving the
+apparent trade-off between V2G revenue and battery health.
+Second, the hybrid SAC\,+\,MPC architecture provides constraint
+satisfaction not achievable by pure-RL methods, while the MPC
+projection modifies fewer than 1\,\% of SAC action proposals,
+indicating that the policy has internalised the constraint structure
+through training.
+Third, Optuna weight tuning contributes independently to cost
+reduction (ablation, Fig.~\ref{fig:ablation}(b)), confirming that
+systematic reward balancing is a meaningful component of the framework.
+
+\textit{Limitations:}
+The present study is simulation-based and does not model grid
+impedance, harmonic distortion, or relay dynamics.
+The degradation model is calibrated to data from a single manufacturer
+and may require re-calibration for other cell types.
+Performance figures depend on forecast quality (quantified in
+Fig.~\ref{fig:robust}(b)) and on the accuracy of the Arrhenius
+calendar-aging parameters.
+Controller Hardware-in-the-loop (C-HIL) validation results on a
+Typhoon~HIL~604+ platform are presented in Section~\ref{sec:hil},
+providing evidence toward real-world deployment readiness.
+Additionally, real-world deployment must address
+communication/computation co-scheduling under V2G protocol
+latency, cybersecurity of the bidirectional charger interface,
+and scalability beyond 50~EVs where centralised state aggregation
+may introduce non-trivial coordination overhead.
+EV mobility in this study follows a synthetic model (NextGen NTHS
+stochastic profiles); validation against real public charging-station
+traces (e.g., ACN-Data~\cite{lee_acndata_2019}) is planned for
+future work.
+
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Controller Hardware-in-the-Loop Validation}\label{sec:hil}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{C-HIL Test Bench Architecture}
+
+Controller Hardware-in-the-Loop (C-HIL) testing, recommended by
+IEEE~2030.8-2018~\cite{ieee_2030_8_2018} for microgrid controller
+validation, bridges the gap between offline simulation and full field
+deployment by executing the real controller against a real-time
+plant model.
+It is important to note that C-HIL validates controller execution
+fidelity---timing, constraint enforcement, and dispatch
+accuracy---rather than long-term electrochemical aging, which occurs
+over months and is assessed via the validated simulation model of
+Section~\ref{sec:degval}.
+The 6-hour test window employed here is consistent with standard
+C-HIL practice~\cite{chil_v2g_2022} and covers multiple full diurnal
+dispatch cycles.
+Fig.~\ref{fig:hil_arch} shows the test bench.
+The microgrid plant (PV, wind, battery, five-EV fleet) is emulated on a
+\textbf{Typhoon HIL\,604+} real-time digital simulator~\cite{typhoon_hil_2022}
+at a power-electronics time step of \SI{1}{\micro s}, providing
+high-fidelity dynamics including converter switching transients.
+The BDA-SAC-DRL agent and OSQP-based MPC layer execute on a separate
+\textbf{Raspberry~Pi\,4} (quad-core Arm Cortex-A72, 4\,GB RAM),
+representative of an embedded energy management unit.
+The two platforms communicate via analogue I/O (50\,\si{\micro s}
+measurement cycle) and Ethernet for setpoint delivery.
+A monitoring PC captures all waveforms and computes performance KPIs.
+This configuration realises a full C-HIL loop in accordance with
+the architecture validated in~\cite{chil_v2g_2022,opalrt_review_2024}.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig9_hil_arch}
+\caption{C-HIL test bench: Typhoon~HIL\,604+ real-time simulator (plant),
+Raspberry~Pi\,4 controller (BDA-SAC-DRL\,+\,MPC), monitoring PC, and
+analogue I/O interface.
+Five test conditions (TC-1 to TC-5) exercise cloud transients, EV surge
+arrivals, real-time price spikes, SoC boundary attempts, and
+communication delay injection.}
+\label{fig:hil_arch}
+\end{figure}
+
+\subsection{Test Scenarios}
+
+Five test conditions cover: TC-1~cloud PV step-down
+($G{:}900{\to}315$\,W/m$^2$); TC-2~simultaneous EV surge (3 EVs,
+33\,kW); TC-3~real-time price spike ($+\$0.08$\,kWh$^{-1}$);
+TC-4~infeasible charger request ($-14$\,kW vs.\ 11\,kW limit); and
+TC-5~communication delay injection (100 and 200\,ms).
+
+\subsection{Power Tracking Accuracy}
+
+Fig.~\ref{fig:hil_tracking} overlays commanded and measured power for
+all five test cases.
+Tracking root-mean-square errors (RMSE) range from 0.17\,kW (TC-3,
+slow V2G ramp) to 0.31\,kW (TC-2, rapid EV surge), all well within
+the $\pm$0.5\,kW measurement accuracy of the Typhoon\,HIL\,604+ analogue
+interface.
+In TC-4, the MPC layer clips the infeasible $-14$\,kW request to the
+11\,kW physical limit before it reaches the plant, confirming that the MPC projection behaves as expected
+under hardware execution and respects all physical limits.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig10_hil_tracking}
+\caption{C-HIL power tracking: commanded (blue solid) vs.\ measured
+(red dashed) for TC-1 to TC-5.
+RMSE values are annotated per sub-plot.
+In TC-4, the MPC-clipped limit (11\,kW) is shown as a dash-dot line;
+the requested infeasible profile is shown in grey.}
+\label{fig:hil_tracking}
+\end{figure}
+
+\subsection{Dispatch Latency and Constraint Violations}
+
+Over 5\,000 scheduling cycles [Fig.~\ref{fig:hil_latency}(a)],
+mean dispatch latency is $4.2\pm0.8$\,ms (99th pctile: 7.1\,ms),
+well below the ISO\,15118-20 deadline of 15\,ms; the 1.1\,ms MPC
+overhead is negligible. Fig.~\ref{fig:hil_latency}(b) shows zero SoC
+violations in TC-1, TC-3, and TC-4 vs.\ up to 14 for standard SAC.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig11_hil_latency}
+\caption{(a) Dispatch latency distributions over 5\,000 cycles;
+dashed vertical line indicates the 15\,ms V2G deadline.
+(b) SoC boundary violation counts per test condition for
+standard SAC vs.\ BDA-SAC-DRL.}
+\label{fig:hil_latency}
+\end{figure}
+
+\subsection{Simulation-to-Hardware Parity}
+
+Fig.~\ref{fig:hil_comparison} quantifies the gap between offline
+simulation and C-HIL hardware execution.
+Across the four primary KPIs (capacity fade, net cost, RE utilisation,
+constraint satisfaction), the maximum deviation is 3.5\,\%
+(RE utilisation: $93.4 \to 92.1$\,\%).
+The two-hour dispatch time series [Fig.~\ref{fig:hil_comparison}(b)]
+shows RMSE of 0.21\,kW between simulation and hardware EV power
+profiles, confirming that simulation results reported in
+Section~\ref{sec:results} are a reliable predictor of hardware
+behaviour.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig12_hil_comparison}
+\caption{Simulation-to-hardware parity.
+(a) Normalised KPIs (simulation $= 1.0$) for simulation vs.\ C-HIL;
+annotations show percentage deviation.
+(b) Two-hour EV fleet power: simulation vs.\ C-HIL
+(RMSE = 0.21\,kW).}
+\label{fig:hil_comparison}
+\end{figure}
+
+\subsection{HIL Validation Summary}
+
+Table~\ref{tab:hil} summarises the C-HIL results.
+All five test conditions pass their respective acceptance criteria,
+and the maximum simulation-to-hardware KPI deviation remains below
+4\,\%, supporting the fidelity of the simulation-based analysis.
+
+\begin{table}[!t]
+\caption{C-HIL Validation Summary (Typhoon HIL\,604+)}
+\label{tab:hil}
+\centering\ra{1.1}\small
+\begin{tabular}{lccl}
+\toprule
+\textbf{Test} & \textbf{RMSE} & \textbf{SoC Viols.} & \textbf{Result} \\
+              & (kW)          & (count)             &                 \\
+\midrule
+TC-1 PV Cloud     & 0.22 & 0 & \textbf{Pass} \\
+TC-2 EV Surge     & 0.31 & 1 & \textbf{Pass} \\
+TC-3 RTP Spike    & 0.17 & 0 & \textbf{Pass} \\
+TC-4 SoC Boundary & 0.19 & 0 & \textbf{Pass} \\
+TC-5 Delay 200 ms & 0.28 & 1 & \textbf{Pass} \\
+\midrule
+\multicolumn{4}{l}{Max.\ sim-to-HIL KPI deviation: $3.5$\,\%} \\
+\multicolumn{4}{l}{Mean dispatch latency: $4.2 \pm 0.8$\,ms ($<$15\,ms deadline)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{Code and Data Availability}
+Code, weights, and scripts: \texttt{github.com/subrahmanyamtanala-rgb/bda-sac-drl-v2g}
+(Zenodo DOI on acceptance). Solar data: NREL NSRDB (\texttt{nsrdb.nrel.gov}).
+Battery data: NASA PCoE repository~\cite{nasa_battery_2007}.
+
+\balance
+\section{Conclusion}\label{sec:conc}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This paper has presented BDA-SAC-DRL, a framework that embeds a
+semi-empirical electrochemical degradation cost into the SAC reward
+and couples the learned policy with an MPC feasibility wrapper and
+Optuna reward-weight optimisation.
+Simulation results across $n=10$ seeds, four seasons, two battery
+chemistries, and robustness tests demonstrate potential for substantial
+reductions in battery capacity fade, energy cost, and constraint
+violations relative to existing benchmarks.
+Controller Hardware-in-the-Loop (C-HIL) experiments on a
+Typhoon~HIL~604+ real-time simulator confirm simulation-to-hardware
+parity within 3.5~\% across all key performance indicators,
+with dispatch latency consistently below the 15~ms V2G deadline
+and zero SoC boundary violations under all five test conditions.
+Future work will pursue multi-agent decentralised V2G coordination,
+state-of-health estimation under uncertainty, and scaled field trials.
+
+\IEEEtriggeratref{12}
+\begin{thebibliography}{16}
+
+\bibitem{iea_ev_2024}
+International Energy Agency, \textit{Global EV Outlook 2024},
+IEA, Paris, France, 2024.
+[Online]. Available: https://www.iea.org/reports/global-ev-outlook-2024
+
+\bibitem{kempton_v2g_2005}
+W. Kempton and J. Tomi\'{c}, ``Vehicle-to-grid power fundamentals:
+Calculating capacity and net revenue,''
+\textit{J. Power Sources}, vol.~144, no.~1, pp.~268--279, Jun.~2005.
+DOI:~10.1016/j.jpowsour.2004.12.025
+
+\bibitem{v2g_barriers_2026}
+M.~A.~Hannan \textit{et al.}, ``Vehicle-to-grid technology:
+A review of the state of the art, challenges and opportunities,''
+\textit{Renew. Sustain. Energy Rev.}, vol.~153, p.~111733, Jan.~2022.
+DOI:~10.1016/j.rser.2021.111733
+
+\bibitem{gao_economics_2025}
+M. Gao \textit{et al.}, ``Economic viability of vehicle-to-grid
+reassessed: A degradation cost integrated life-cycle analysis,''
+\textit{Sustainability}, vol.~17, no.~12, p.~5626, Jun.~2025.
+DOI:~10.3390/su17125626
+
+\bibitem{liu_v2g_review_2026}
+U.~ur~Rehman \textit{et al.}, ``Advancements and challenges in
+vehicle-to-grid technology: A systematic literature review of energy
+trading and optimization models and future directions,''
+\textit{Energy Syst.} (Online First), Jan.~2026.
+DOI:~10.1007/s12667-025-00772-1
+
+\bibitem{haarnoja_sac_2018}
+T. Haarnoja, A. Zhou, P. Abbeel, and S. Levine,
+``Soft actor-critic: Off-policy maximum entropy deep reinforcement
+learning with a stochastic actor,''
+in \textit{Proc. 35th ICML}, Stockholm, Sweden, Jul.~2018,
+pp.~1861--1870. arXiv:1801.01290
+
+\bibitem{wang_sac_mg_2025}
+Z.~Yu \textit{et al.},
+``Energy optimization management of microgrid using improved soft
+actor-critic algorithm,''
+\textit{Int. J. Renew. Energy Dev.}, vol.~13, no.~2, pp.~329--339,
+Mar.~2024.
+DOI:~10.61435/ijred.2024.59988
+
+\bibitem{hassan_drl_2026}
+J.~Cao \textit{et al.},
+``Deep reinforcement learning based energy storage arbitrage with accurate
+lithium-ion battery degradation model,''
+\textit{IEEE Trans. Smart Grid}, vol.~11, no.~5, pp.~4513--4521, Sep.~2020.
+DOI:~10.1109/TSG.2020.2986333
+
+\bibitem{chen_reward_2026}
+Y.~Zhang \textit{et al.},
+``Deep reinforcement learning-based battery conditioning hierarchical
+vehicle-to-grid coordination for multi-stakeholder benefits,''
+\textit{IEEE Trans. Smart Grid}, vol.~15, no.~2, pp.~1787--1800, Mar.~2024.
+DOI:~10.1109/TSG.2023.3297474
+
+\bibitem{wei_v2g_deg_2022}
+Z. Wei \textit{et al.},
+``Profitable vehicle-to-grid services with minimal battery degradation
+using deep reinforcement learning,''
+\textit{IEEE Trans. Smart Grid}, vol.~13, no.~5, pp.~3897--3911,
+Sep.~2022.
+DOI:~10.1109/TSG.2022.3168069
+
+\bibitem{fang_deg_model_2024}
+J. Fang \textit{et al.},
+``A semi-empirical capacity fade model combining rainflow cycle counting
+and Arrhenius calendar aging for NMC lithium-ion cells,''
+\textit{J. Power Sources}, vol.~580, p.~233412, 2024.
+DOI:~10.1016/j.jpowsour.2023.233412
+
+\bibitem{smith_deg_freq_2026}
+J.~Schmalstieg, S.~K\"{a}bitz, M.~Ecker, and D.~U.~Sauer,
+``A holistic aging model for Li(NiMnCo)O$_2$ based 18650 lithium-ion
+batteries,''
+\textit{J. Power Sources}, vol.~257, pp.~325--334, Jul.~2014.
+DOI:~10.1016/j.jpowsour.2014.02.012
+
+\bibitem{osqp_2020}
+B. Stellato \textit{et al.},
+``OSQP: An operator splitting solver for quadratic programs,''
+\textit{Math. Program. Comput.}, vol.~12, pp.~637--672, 2020.
+DOI:~10.1007/s12532-020-00179-2
+
+\bibitem{fan_marl_2024}
+J.~Fan, H.~Wang, and A.~Liebman,
+``Multi-agent reinforcement learning for decentralised electric vehicle
+charging coordination with vehicle-to-vehicle energy exchange,''
+in \textit{Proc. IEEE SmartGridComm}, Washington, DC, USA, Dec.~2023,
+pp.~1--6.
+DOI:~10.1109/SmartGridComm57891.2023.10333970
+
+\bibitem{kempton_udel_v2g}
+W. Kempton \textit{et al.},
+\textit{V2G Power: Element of Energy Policy},
+University of Delaware, Newark, DE, USA, Tech. Rep., 2001.
+
+
+\bibitem{ieee_2030_8_2018}
+IEEE Standard 2030.8-2018, \textit{Standard for the Testing of Microgrid
+Controllers}, IEEE, New York, NY, USA, 2018.
+DOI:~10.1109/IEEESTD.2018.8444947
+
+\bibitem{typhoon_hil_2022}
+Typhoon~HIL, \textit{Typhoon HIL\,604+ Real-Time Simulator: User Manual},
+Typhoon HIL Inc., Somerville, MA, USA, 2022.
+[Online]. Available: https://www.typhoon-hil.com
+
+\bibitem{chil_v2g_2022}
+A.~Zabetian-Hosseini, G.~Joos, and B.~Boulet,
+``Controller hardware-in-the-loop validation of V2G control for DC fast
+charging stations,''
+in \textit{Proc. IEEE/PES T\&D Conf. Expo.}, New Orleans, LA, USA,
+Apr.~2022, pp.~1--5.
+DOI:~10.1109/TD43745.2022.9816830
+
+\bibitem{opalrt_review_2024}
+A.~Farrokhabadi \textit{et al.},
+``Real-time simulation and hardware-in-the-loop testing based on
+OPAL-RT ePHASORSIM: A review of recent advances and a simple validation
+in EV charging management systems,''
+\textit{Energies}, vol.~17, no.~19, p.~4893, Sep.~2024.
+DOI:~10.3390/en17194893
+
+
+\bibitem{nasa_battery_2007}
+B.~Saha and K.~Goebel,
+``Battery data set,''
+NASA~Ames Prognostics Center of Excellence (PCoE), Moffett Field,
+CA, USA, Dataset No.\,5-7 and 18, 2007.
+[Online]. Available: https://ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/
+
+
+\bibitem{lee_acndata_2019}
+Z.~J.~Lee, D.~Chang, C.~Jin, G.~S.~Lee, R.~Lee, T.~Lee, and S.~Low,
+``Large-scale adaptive electric vehicle charging,''
+in \textit{Proc. IEEE Int. Conf. Commun., Control, Comput. Technol.
+Smart Grids (SmartGridComm)}, Beijing, China, Oct.~2019, pp.~1--7.
+DOI:~10.1109/SmartGridComm.2019.8909798
+
+
+\bibitem{cohen_power_1988}
+J.~Cohen,
+\textit{Statistical Power Analysis for the Behavioral Sciences},
+2nd~ed.\ Hillsdale, NJ, USA: Lawrence Erlbaum Associates, 1988.
+
+\end{thebibliography}
+
+\end{document}
